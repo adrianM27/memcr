@@ -54,6 +54,7 @@
 #include "arch/cpu.h"
 #include "arch/enter.h"
 #include "parasite-blob.h"
+#include "md5.h"
 
 #define NT_PRSTATUS 1
 
@@ -154,6 +155,63 @@ static unsigned long parasite_status_changed;
 #define PID_INVALID		0
 static pid_t checkpointed_pids[CHECKPOINTED_PIDS_LIMIT];
 static pid_t checkpoint_workers[CHECKPOINTED_PIDS_LIMIT];
+
+#define MD5_DIGEST_SIZE		16
+#define MD5_BLOCKSIZE		4096
+static struct md5_ctx md5_checkpoint_ctx;
+static struct md5_ctx md5_restore_ctx;
+static uint8_t md5_checkpoint_digest[MD5_DIGEST_SIZE];
+static uint8_t md5_restore_digest[MD5_DIGEST_SIZE];
+/* md5_block length taken from md5_stream function of md5.c */
+static char md5_block[MD5_BLOCKSIZE + 72];
+static size_t md5_block_sum;
+static int md5_enabled;
+
+static void md5_init(struct md5_ctx *ctx)
+{
+	md5_init_ctx (ctx);
+	md5_block_sum = 0;
+}
+
+static void md5_update(char *data, size_t len, struct md5_ctx *ctx)
+{
+	size_t buf_free_len;
+	size_t to_copy;
+	/* Process only full blocks */
+	while (1)
+	{
+		buf_free_len = MD5_BLOCKSIZE - md5_block_sum;
+		to_copy = (len > buf_free_len) ? buf_free_len : len;
+		memcpy(md5_block + md5_block_sum, data, to_copy);
+		md5_block_sum += to_copy;
+
+		if (md5_block_sum == MD5_BLOCKSIZE) {
+			/* Process buffer with BLOCKSIZE bytes.  Note that
+				BLOCKSIZE % 64 == 0
+			*/
+			md5_process_block(md5_block, MD5_BLOCKSIZE, ctx);
+			md5_block_sum = 0;
+		} else {
+			/* Lack of full block, return */
+			return;
+		}
+
+		data += to_copy;
+		len -= to_copy;
+	}
+}
+
+static void md5_finish(struct md5_ctx *ctx, void *resblock)
+{
+	/* Process any remaining bytes.  */
+	if (md5_block_sum > 0) {
+		md5_process_bytes(md5_block, md5_block_sum, ctx);
+		md5_block_sum = 0;
+	}
+
+	/* Construct result in desired memory.  */
+	md5_finish_ctx(ctx, resblock);
+}
 
 static void parasite_status_signal(pid_t pid, int status)
 {
@@ -829,9 +887,15 @@ static int compress_lz4_and_write(const char *buf, unsigned long len, int fd)
 	if (ret != sizeof(dstSize))
 		return -1;
 
-	ret = _write(fd, &compr, dstSize);
+	ret = _write(fd, compr, dstSize);
 	if (ret != dstSize)
 		return -1;
+
+	if(md5_enabled)
+	{
+		md5_update((char*)&dstSize, sizeof(dstSize), &md5_checkpoint_ctx);
+		md5_update((char*)compr, dstSize, &md5_checkpoint_ctx);
+	}
 
 	return 0;
 }
@@ -848,6 +912,12 @@ static int read_and_decompress_lz4(char* buf, int fd)
 	ret = _read(fd, &compr, srcSize);
 	if (ret != srcSize)
 		return -1;
+
+	if (md5_enabled)
+	{
+		md5_update((char*)&srcSize, sizeof(srcSize), &md5_restore_ctx);
+		md5_update((char*)compr, srcSize, &md5_restore_ctx);
+	}
 
 	ret = LZ4_decompress_safe(compr, buf, srcSize, MAX_VM_REGION_SIZE);
 	fprintf(stdout, "[+] Decompressed %d Bytes back into %d.\n", srcSize, ret);
@@ -887,6 +957,9 @@ static int get_mem_region(int md, int cd, unsigned long addr, unsigned long len,
 	ret = _write(fd, &buf, len);
 	if (ret != len)
 		return -1;
+
+	if (md5_enabled)
+		md5_update(buf, len, &md5_checkpoint_ctx);
 #endif
 
 	ret = parasite_write(cd, &req, sizeof(req));
@@ -925,6 +998,9 @@ static int get_target_mem_region(int cd, unsigned long addr, unsigned long len, 
 	ret = _write(fd, &buf, len);
 	if (ret != len)
 		return -1;
+
+	if (md5_enabled)
+		md5_update(buf, len, &md5_checkpoint_ctx);
 #endif
 
 	return 0;
@@ -1015,6 +1091,9 @@ static int get_vma_pages(int pd, int md, int cd, struct vm_area *vma, int fd)
 			ret = _write(fd, &vmr, sizeof(vmr));
 			if (ret != sizeof(vmr))
 				return -1;
+
+			if (md5_enabled)
+				md5_update((char*)&vmr, sizeof(vmr), &md5_checkpoint_ctx);
 
 			if (proc_mem) {
 				ret = get_mem_region(md, cd, region_start, region_length, fd);
@@ -1226,6 +1305,9 @@ static int target_set_pages(pid_t pid)
 		if (ret == 0)
 			break;
 
+		if (md5_enabled)
+			md5_update((char*)&vmr, sizeof(vmr), &md5_restore_ctx);
+
 #ifdef DUMP_COMPRESSION_LZ4
 		ret = read_and_decompress_lz4(buf, fd);
 		if (ret)
@@ -1234,6 +1316,9 @@ static int target_set_pages(pid_t pid)
 		ret = _read(fd, &buf, vmr.len);
 		if (ret == 0)
 			break;
+
+		if (md5_enabled)
+			md5_update((char*)buf, vmr.len, &md5_restore_ctx);
 #endif
 
 		req.vmr = vmr;
@@ -1317,10 +1402,18 @@ static int cmd_checkpoint(pid_t pid)
 	fprintf(stdout, "[+] mprotect off\n");
 	target_mprotect_off(pid);
 
+	if (md5_enabled)
+		md5_init(&md5_checkpoint_ctx);
+
 	fprintf(stdout, "[+] downloading pages\n");
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	ret = get_target_pages(pid, vmas, nr_vmas);
+
+	if (md5_enabled)
+		md5_finish(&md5_checkpoint_ctx, md5_checkpoint_digest);
+
 	if (ret) {
+		
 		fprintf(stderr, "get_target_pages() failed\n");
 
 		char path[PATH_MAX];
@@ -1354,10 +1447,35 @@ static int cmd_restore(pid_t pid)
 		return 1;
 	}
 
+	if (md5_enabled)
+		md5_init(&md5_restore_ctx);
+
 	fprintf(stdout, "[+] uploading pages\n");
 	clock_gettime(CLOCK_MONOTONIC, &ts);
+
 	target_set_pages(pid);
 	fprintf(stdout, "[i] upload took %lu ms\n", diff_ms(&ts));
+
+	if (md5_enabled)
+	{
+		md5_finish(&md5_restore_ctx, md5_restore_digest);
+		uint8_t *b = (uint8_t*)md5_checkpoint_digest;
+		fprintf(stdout, "[+] checkpoint crc: %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X\n", 
+			b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+
+		b = (uint8_t*)md5_restore_digest;
+		fprintf(stdout, "[+] restore crc: %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X %X\n", 
+			b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+		if (memcmp(md5_checkpoint_digest, md5_restore_digest, MD5_DIGEST_SIZE) != 0)
+		{
+			printf("[-] dump checksum do not match!\n");
+			if (parasite_socket_dir)
+				cleanup_socket(pid);
+
+			return 1;
+			//FIXME: return not handled
+		}
+	}
 
 	fprintf(stdout, "[+] mprotect on\n");
 	target_mprotect_on(pid);
@@ -2172,7 +2290,7 @@ out:
 static void usage(const char *name, int status)
 {
 	fprintf(status ? stderr : stdout,
-		"%s [-p PID] [-d DIR] [-S DIR] [-l PORT|PATH] [-n]\n" \
+		"%s [-p PID] [-d DIR] [-S DIR] [-l PORT|PATH] [-n] [-f] [-c]\n" \
 		"options: \n" \
 		"  -h --help\thelp\n" \
 		"  -p --pid\ttarget processs pid\n" \
@@ -2184,7 +2302,8 @@ static void usage(const char *name, int status)
 		"        -l PATH: filesystem path for UNIX domain socket file (will be created)\n" \
 		"  -n --no-wait\tno wait for key press\n" \
 		"  -m --proc-mem\tget pages from /proc/pid/mem\n" \
-		"  -f --rss-file\tinclude file mapped memory\n",
+		"  -f --rss-file\tinclude file mapped memory\n" \
+		"  -c --checksum\tenable md5 checksum for memory dump\n",
 		name);
 	exit(status);
 }
@@ -2217,13 +2336,14 @@ int main(int argc, char *argv[])
 		{ "no-wait",			0,	0,	0},
 		{ "proc-mem",			0,	0,	0},
 		{ "rss-file",			0,	0,	0},
+		{ "checksum",			0,	0,	0},
 		{ NULL,			0,	0,	0}
 	};
 
 	dump_dir = "/tmp";
 	parasite_socket_dir = NULL;
 
-	while ((opt = getopt_long(argc, argv, "hp:d:S:l:nmf", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hp:d:S:l:nmfc", long_options, &option_index)) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0], 0);
@@ -2248,6 +2368,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'f':
 				rss_file = 1;
+				break;
+			case 'c':
+				md5_enabled = 1;
 				break;
 			default: /* '?' */
 				usage(argv[0], 1);

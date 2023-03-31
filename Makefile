@@ -118,10 +118,13 @@ $(B)/enter.o: arch/$(ARCH)/enter.c
 $(B)/cpu.o: arch/$(ARCH)/cpu.c
 	$(CC) $(MCFLAGS) -c $^ -o $@
 
+$(B)/md5.o: md5.c
+	$(CC) $(MCFLAGS) -Os -c $^ -o $@
+	
 $(B)/memcr.o: memcr.c $(B)/parasite-blob.h
 	$(CC) $(MCFLAGS) -I$(B) -c $< -o $@
 
-$(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o
+$(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o $(B)/md5.o
 	$(CC) $(MCFLAGS) $^ $(LDFLAGS) -o $@
 
 $(B)/memcr-client.o: memcr-client.c
