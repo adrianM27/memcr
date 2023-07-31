@@ -179,6 +179,8 @@ static unsigned char md5_restore_digest[MD5_DIGEST_SIZE];
 static unsigned int md5_restore_digest_len;
 static int md5_enabled;
 
+static memcr_aes_config *aes;
+
 static void md5_init(void *ctx)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -937,11 +939,11 @@ static int compress_lz4_and_write(const char *buf, unsigned long len, int fd)
 	if (dstSize == 0)
 		return -1;
 
-	ret = _write(fd, &dstSize, sizeof(dstSize));
+	ret = aes->write(&dstSize, sizeof(dstSize), fd);
 	if (ret != sizeof(dstSize))
 		return -1;
 
-	ret = _write(fd, compr, dstSize);
+	ret = aes->write(compr, dstSize, fd);
 	if (ret != dstSize)
 		return -1;
 
@@ -958,11 +960,15 @@ static int read_and_decompress_lz4(char* buf, int fd)
 	int ret, srcSize;
 	char compr[MAX_LZ4_DST_SIZE];
 
-	ret = _read(fd, &srcSize, sizeof(srcSize));
+	//ret = _read(fd, &srcSize, sizeof(srcSize));
+	ret = aes->read(&srcSize, sizeof(srcSize), fd);
 	if (ret != sizeof(srcSize))
 		return -1;
 
-	ret = _read(fd, &compr, srcSize);
+	fprintf(stdout, "[+]Compressed size %d.\n", srcSize);
+
+	//ret = _read(fd, &compr, srcSize);
+	ret = aes->read(&compr, srcSize, fd);
 	if (ret != srcSize)
 		return -1;
 
@@ -1140,7 +1146,8 @@ static int get_vma_pages(int pd, int md, int cd, struct vm_area *vma, int fd)
 			vmr.addr = region_start;
 			vmr.len = region_length;
 
-			ret = _write(fd, &vmr, sizeof(vmr));
+			//ret = _write(fd, &vmr, sizeof(vmr));
+			ret = aes->write(&vmr, sizeof(vmr), fd);
 			if (ret != sizeof(vmr))
 				return -1;
 
@@ -1249,6 +1256,8 @@ static int get_target_pages(int pid, struct vm_area vmas[], int nr_vmas)
 			break;
 	}
 
+	aes->finish(fd);
+
 out:
 	close(cd);
 	close(md);
@@ -1353,7 +1362,8 @@ static int target_set_pages(pid_t pid)
 		struct vm_region_req req;
 		char buf[MAX_VM_REGION_SIZE];
 
-		ret = _read(fd, &vmr, sizeof(vmr));
+		//ret = _read(fd, &vmr, sizeof(vmr));
+		ret = aes->read(&vmr, sizeof(vmr), fd);
 		if (ret == 0)
 			break;
 
@@ -1365,7 +1375,8 @@ static int target_set_pages(pid_t pid)
 		if (ret)
 			break;
 #else
-		ret = _read(fd, &buf, vmr.len);
+		//ret = _read(fd, &buf, vmr.len);
+		ret = aes->read(&buf, vmr.len, fd);
 		if (ret == 0)
 			break;
 
@@ -2035,6 +2046,8 @@ static int checkpoint_worker(pid_t pid)
 {
 	int ret;
 
+	aes->init();
+
 	ret = seize_target(pid);
 	if (ret)
 		return ret;
@@ -2325,6 +2338,8 @@ static int user_interactive_mode(pid_t pid)
 	if (ret)
 		return ret;
 
+	aes->init();
+
 	ret = execute_parasite_checkpoint(pid);
 	if (ret)
 		goto out;
@@ -2386,7 +2401,13 @@ void die(const char *fmt, ...)
 	exit(1);
 }
 
-int main(int argc, char *argv[])
+void memcr_set_aes(memcr_aes_config *conf)
+{
+	aes = conf;
+	fprintf(stdout, "Aes ptr %d\n", (int)aes);
+}
+
+int memcr_main(int argc, char *argv[])
 {
 	int ret;
 	int opt;

@@ -20,6 +20,13 @@
 #define __MEMCR_H__
 
 #include <stdint.h>
+#include <stddef.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#ifdef __cplusplus
+extern "C" { 
+#endif
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -84,6 +91,20 @@ struct target_context {
 	uint64_t sigset;
 	unsigned long *blob;
 };
+
+typedef struct {
+	void (*init)(void);
+	int (*write)(const void *, size_t , int );
+	int (*read)(void *, size_t , int);
+    void (*finish)(int);
+} memcr_aes_config;
+
+void memcr_set_aes(memcr_aes_config *conf);
+int memcr_main(int argc, char *argv[]);
+
+#ifdef __cplusplus
+} 
+#endif
 
 #endif
 

@@ -25,13 +25,22 @@ ifeq ("$(origin LD)", "default")
     undefine LD
 endif
 
-CFLAGS = -Wall -Werror
+CFLAGS = -Wall
 # memcr CFLAGS
-MCFLAGS = $(CFLAGS) -g
+MCFLAGS = $(CFLAGS) -g -fPIC
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/com
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/core
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/interfaces
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/plugins
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/tracing
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/protocols
+#MCFLAGS += -I/home/developer/rdk/rdk-workspace/build-platco-cad15/tmp/work/armv7at2hf-neon-rdk-linux-gnueabi/memcr/1.0+gitAUTOINC+ff002a6621-r0/recipe-sysroot/usr/include/WPEFramework/warningreporting
+
 # parasite CFLAGS
 PCFLAGS = $(CFLAGS)
 
-LDFLAGS = -lpthread -lcrypto
+LDFLAGS = -lpthread -lcrypto -fPIC
 
 ifeq ($(MEMCR_DUMP_COMPRESSION_LZ4), 1)
     MCFLAGS += -DDUMP_COMPRESSION_LZ4
@@ -118,11 +127,12 @@ $(B)/enter.o: arch/$(ARCH)/enter.c
 $(B)/cpu.o: arch/$(ARCH)/cpu.c
 	$(CC) $(MCFLAGS) -c $^ -o $@
 
-$(B)/memcr.o: memcr.c $(B)/parasite-blob.h
+$(B)/memcr.o: memcr.c $(B)/parasite-blob.h 
 	$(CC) $(MCFLAGS) -I$(B) -c $< -o $@
 
+
 $(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o
-	$(CC) $(MCFLAGS) $^ $(LDFLAGS) -o $@
+	$(CC) -shared $(CFLAGS) $^ -o lib$@.so
 
 $(B)/memcr-client.o: memcr-client.c
 	$(CC) $(CFLAGS) -I$(B) -c $< -o $@
