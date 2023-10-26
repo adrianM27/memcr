@@ -35,7 +35,7 @@ LDFLAGS = -lpthread
 
 ifeq ($(COMPRESS_LZ4), 1)
     MCFLAGS += -DCOMPRESS_LZ4
-    LDFLAGS += -llz4
+    LDFLAGS += -llz4 -lzstd
 endif
 
 ifeq ($(CHECKSUM_MD5), 1)

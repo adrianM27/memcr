@@ -49,6 +49,7 @@
 
 #ifdef COMPRESS_LZ4
 #include <lz4.h>
+#include <zstd.h>
 #endif
 
 #ifdef CHECKSUM_MD5
@@ -760,7 +761,8 @@ static int read_vm_region(int fd, struct vm_region *vmr, char *buf)
 		if (ret != src_size)
 			return -1;
 
-		ret = LZ4_decompress_safe(src, buf, src_size, MAX_VM_REGION_SIZE);
+		//ret = LZ4_decompress_safe(src, buf, src_size, MAX_VM_REGION_SIZE);
+		ret = ZSTD_decompress(buf, MAX_VM_REGION_SIZE, src, src_size);
 		/* fprintf(stdout, "[+] Decompressed %d Bytes back into %d.\n", srcSize, ret); */
 		if (ret <= 0)
 			return -1;
@@ -791,7 +793,8 @@ static int write_vm_region(int fd, const struct vm_region *vmr, const void *buf)
 		char dst[MAX_LZ4_DST_SIZE];
 		int dst_size;
 
-		dst_size = LZ4_compress_default(buf, dst, vmr->len, MAX_LZ4_DST_SIZE);
+		//dst_size = LZ4_compress_default(buf, dst, vmr->len, MAX_LZ4_DST_SIZE);
+		dst_size = ZSTD_compress(dst, MAX_LZ4_DST_SIZE, buf, vmr->len, 22);
 		/* fprintf(stdout, "[+] Compressed %lu Bytes into %d.\n", len, dstSize); */
 		if (dst_size <= 0)
 			return -1;
