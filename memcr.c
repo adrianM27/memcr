@@ -177,7 +177,7 @@ int __attribute__((weak)) lib__write(int fd, const void *buf, size_t count);
 int __attribute__((weak)) lib__init(int enable, const char *arg);
 int __attribute__((weak)) lib__fini(void);
 
-#define CHECKPOINTED_PIDS_LIMIT 16
+#define CHECKPOINTED_PIDS_LIMIT 48
 #define PID_INVALID		0
 #define STATE_RESTORED			0
 #define STATE_CHECKPOINTING		1
