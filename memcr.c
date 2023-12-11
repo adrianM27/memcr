@@ -139,7 +139,7 @@ static int nr_threads;
 
 #define SERVICE_MODE_SELECT_TIMEOUT_MS	100
 
-#define MAX_VMAS			4096
+#define MAX_VMAS			(3*4096)
 static struct vm_area vmas[MAX_VMAS];
 static int nr_vmas;
 
