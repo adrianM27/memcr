@@ -51,6 +51,10 @@
 #include <lz4.h>
 #endif
 
+#ifdef COMPRESS_ZSTD
+#include <zstd.h>
+#endif
+
 #ifdef CHECKSUM_MD5
 #include <openssl/opensslv.h>
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -110,13 +114,13 @@ struct vm_area {
 	unsigned long flags;
 };
 
-static char *dump_dir;
+static char *dfl_dump_dir;
 static char *parasite_socket_dir;
 static int parasite_socket_use_netns;
 static int no_wait;
 static int proc_mem;
 static int rss_file;
-static int compress;
+static memcr_compress_alg dfl_compress_alg;
 static int checksum;
 static int service;
 static unsigned int timeout;
@@ -149,6 +153,13 @@ static int nr_vmas;
 
 #ifdef COMPRESS_LZ4
 #define MAX_LZ4_DST_SIZE LZ4_compressBound(MAX_VM_REGION_SIZE)
+#endif
+
+#ifdef COMPRESS_ZSTD
+#define MAX_ZSTD_DST_SIZE	ZSTD_compressBound(MAX_VM_REGION_SIZE)
+#ifndef COMPRESS_ZSTD_LVL
+#define COMPRESS_ZSTD_LVL	3
+#endif
 #endif
 
 static pid_t parasite_pid;
@@ -198,6 +209,7 @@ static struct {
 	int state;
 	int checkpoint_abort;
 	int checkpoint_cmd_sd;
+	struct service_options options;
 } checkpoint_service_data[CHECKPOINTED_PIDS_LIMIT];
 
 #define SOCKET_INVALID				(-1)
@@ -348,6 +360,17 @@ static void md5_final(unsigned char *md, unsigned int *len, void *ctx)
 }
 #endif
 
+static void die(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+
+	exit(1);
+}
+
 static void parasite_status_signal(pid_t pid, int status)
 {
 	pthread_mutex_lock(&parasite_watch.lock);
@@ -422,7 +445,7 @@ static void parasite_socket_init(struct sockaddr_un *addr, pid_t pid)
 	}
 }
 
-static void cleanup_pid(pid_t pid)
+static void cleanup_pid(pid_t pid, const char* dump_dir)
 {
 	char path[PATH_MAX];
 
@@ -812,7 +835,15 @@ static int dump_write(int fd, const void *buf, size_t count)
 	return ret;
 }
 
-static void init_pid_checkpoint_data(pid_t pid)
+static void clear_checkpoint_options(struct service_options *options)
+{
+	options->is_dump_dir = FALSE;
+	options->dump_dir[0] = 0;
+	options->is_compress_alg = FALSE;
+	options->compress_alg = MEMCR_COMPRESS_NONE;
+}
+
+static void init_pid_checkpoint_data(pid_t pid, struct service_options *options)
 {
 	pthread_mutex_lock(&checkpoint_service_data_lock);
 	for (int i=0; i<CHECKPOINTED_PIDS_LIMIT; ++i) {
@@ -821,6 +852,15 @@ static void init_pid_checkpoint_data(pid_t pid)
 			checkpoint_service_data[i].worker = PID_INVALID;
 			checkpoint_service_data[i].checkpoint_cmd_sd = SOCKET_INVALID;
 			checkpoint_service_data[i].state = STATE_RESTORED;
+			if (options) {
+				checkpoint_service_data[i].options.is_dump_dir = options->is_dump_dir;
+				strncpy(checkpoint_service_data[i].options.dump_dir, options->dump_dir,
+					MEMCR_DUMPDIR_LEN_MAX);
+				checkpoint_service_data[i].options.is_compress_alg = options->is_compress_alg;
+				checkpoint_service_data[i].options.compress_alg = options->compress_alg;
+			} else {
+				clear_checkpoint_options(&checkpoint_service_data[i].options);
+			}
 			pthread_mutex_unlock(&checkpoint_service_data_lock);
 			return;
 		}
@@ -837,11 +877,14 @@ static void cleanup_checkpointed_pids(void)
 		if (checkpoint_service_data[i].pid != PID_INVALID) {
 			fprintf(stdout, "[i] Killing PID %d\n", checkpoint_service_data[i].pid);
 			kill(checkpoint_service_data[i].pid, SIGKILL);
-			cleanup_pid(checkpoint_service_data[i].pid);
+			const char *dir = checkpoint_service_data[i].options.is_dump_dir ?
+				checkpoint_service_data[i].options.dump_dir : dfl_dump_dir;
+			cleanup_pid(checkpoint_service_data[i].pid, dir);
 			checkpoint_service_data[i].pid = PID_INVALID;
 			checkpoint_service_data[i].worker = PID_INVALID;
 			checkpoint_service_data[i].state = STATE_RESTORED;
 			checkpoint_service_data[i].checkpoint_cmd_sd = SOCKET_INVALID;
+			clear_checkpoint_options(&checkpoint_service_data[i].options);
 		}
 	}
 	pthread_mutex_unlock(&checkpoint_service_data_lock);
@@ -904,6 +947,7 @@ static void clear_pid_checkpoint_data(pid_t pid)
 			checkpoint_service_data[i].worker = PID_INVALID;
 			checkpoint_service_data[i].checkpoint_cmd_sd = SOCKET_INVALID;
 			checkpoint_service_data[i].state = STATE_RESTORED;
+			clear_checkpoint_options(&checkpoint_service_data[i].options);
 		}
 	}
 	pthread_mutex_unlock(&checkpoint_service_data_lock);
@@ -915,11 +959,14 @@ static void clear_pid_on_worker_exit_non_blocking(pid_t worker)
 		if (checkpoint_service_data[i].worker == worker) {
 			fprintf(stdout, "[+] Clearing pid: %d with worker: %d ...\n",
 				checkpoint_service_data[i].pid, worker);
-			cleanup_pid(checkpoint_service_data[i].pid);
+			const char *dir = checkpoint_service_data[i].options.is_dump_dir ?
+				checkpoint_service_data[i].options.dump_dir : dfl_dump_dir;
+			cleanup_pid(checkpoint_service_data[i].pid, dir);
 			checkpoint_service_data[i].pid = PID_INVALID;
 			checkpoint_service_data[i].worker = PID_INVALID;
 			checkpoint_service_data[i].checkpoint_cmd_sd = SOCKET_INVALID;
 			checkpoint_service_data[i].state = STATE_RESTORED;
+			clear_checkpoint_options(&checkpoint_service_data[i].options);
 		}
 	}
 }
@@ -1023,10 +1070,27 @@ static int read_vm_region(int fd, struct vm_region *vmr, char *buf)
 	if (!vm_region_valid(vmr))
 		return -1;
 
-#ifdef COMPRESS_LZ4
-	if (compress) {
+
+	if (dfl_compress_alg != MEMCR_COMPRESS_NONE) {
 		int src_size;
-		char src[MAX_LZ4_DST_SIZE];
+		int src_size_max = 0;
+
+		switch (dfl_compress_alg) {
+#ifdef COMPRESS_LZ4
+			case MEMCR_COMPRESS_LZ4:
+				src_size_max = MAX_LZ4_DST_SIZE;
+				break;
+#endif
+#ifdef COMPRESS_ZSTD
+			case MEMCR_COMPRESS_ZSTD:
+				src_size_max = MAX_ZSTD_DST_SIZE;
+				break;
+#endif
+			default:
+				die("compression set but not enabled, recompile with COMPRESS_LZ4=1 and/or COMPRESS_ZSTD=1");
+		}
+
+		char src[src_size_max];
 
 		ret = dump_read(fd, &src_size, sizeof(src_size));
 		if (ret != sizeof(src_size))
@@ -1036,13 +1100,24 @@ static int read_vm_region(int fd, struct vm_region *vmr, char *buf)
 		if (ret != src_size)
 			return -1;
 
-		ret = LZ4_decompress_safe(src, buf, src_size, MAX_VM_REGION_SIZE);
+		switch (dfl_compress_alg) {
+#ifdef COMPRESS_LZ4
+			case MEMCR_COMPRESS_LZ4:
+				ret = LZ4_decompress_safe(src, buf, src_size, MAX_VM_REGION_SIZE);
+				break;
+#endif
+#ifdef COMPRESS_ZSTD
+			case MEMCR_COMPRESS_ZSTD:
+				ret = ZSTD_decompress(buf, MAX_VM_REGION_SIZE, src, src_size);
+				break;
+#endif
+			default:
+				die("compression set but not enabled, recompile with COMPRESS_LZ4=1 and/or COMPRESS_ZSTD=1");
+		}
 		/* fprintf(stdout, "[+] Decompressed %d Bytes back into %d.\n", srcSize, ret); */
 		if (ret <= 0)
 			return -1;
-	} else
-#endif
-	{
+	} else {
 		ret = dump_read(fd, buf, vmr->len);
 		if (ret != vmr->len)
 			return -1;
@@ -1062,12 +1137,39 @@ static int write_vm_region(int fd, const struct vm_region *vmr, const void *buf)
 	if (ret != sizeof(struct vm_region))
 		return -1;
 
+	if (dfl_compress_alg != MEMCR_COMPRESS_NONE) {
+		int dst_size_max = 0;
+		switch (dfl_compress_alg) {
 #ifdef COMPRESS_LZ4
-	if (compress) {
-		char dst[MAX_LZ4_DST_SIZE];
-		int dst_size;
+			case MEMCR_COMPRESS_LZ4:
+				dst_size_max = MAX_LZ4_DST_SIZE;
+				break;
+#endif
+#ifdef COMPRESS_ZSTD
+			case MEMCR_COMPRESS_ZSTD:
+				dst_size_max = MAX_ZSTD_DST_SIZE;
+				break;
+#endif
+			default:
+				die("compression set but not enabled, recompile with COMPRESS_LZ4=1 and/or COMPRESS_ZSTD=1");
+		}
+		char dst[dst_size_max];
+		int dst_size = 0;
 
-		dst_size = LZ4_compress_default(buf, dst, vmr->len, MAX_LZ4_DST_SIZE);
+		switch (dfl_compress_alg) {
+#ifdef COMPRESS_LZ4
+			case MEMCR_COMPRESS_LZ4:
+				dst_size = LZ4_compress_default(buf, dst, vmr->len, MAX_LZ4_DST_SIZE);
+				break;
+#endif
+#ifdef COMPRESS_ZSTD
+			case MEMCR_COMPRESS_ZSTD:
+				dst_size = ZSTD_compress(dst, MAX_ZSTD_DST_SIZE, buf, vmr->len, COMPRESS_ZSTD_LVL);
+				break;
+#endif
+			default:
+				die("compression set but not enabled, recompile with COMPRESS_LZ4=1 and/or COMPRESS_ZSTD=1");
+		}
 		/* fprintf(stdout, "[+] Compressed %lu Bytes into %d.\n", len, dstSize); */
 		if (dst_size <= 0)
 			return -1;
@@ -1080,9 +1182,7 @@ static int write_vm_region(int fd, const struct vm_region *vmr, const void *buf)
 		if (ret != dst_size)
 			return -1;
 
-	} else
-#endif
-	{
+	} else {
 		ret = dump_write(fd, buf, vmr->len);
 		if (ret != vmr->len)
 			return -1;
@@ -1555,7 +1655,7 @@ static int get_target_pages(int pid, struct vm_area vmas[], int nr_vmas)
 	if (pd < 0)
 		goto out;
 
-	snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
+	snprintf(path, sizeof(path), "%s/pages-%d.img", dfl_dump_dir, pid);
 
 	fd = dump_open(path, O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR);
 	if (fd < 0) {
@@ -1674,7 +1774,7 @@ static int target_set_pages(pid_t pid)
 	int cd = -1;
 	int fd = -1;
 
-	snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
+	snprintf(path, sizeof(path), "%s/pages-%d.img", dfl_dump_dir, pid);
 
 	fd = dump_open(path, O_RDONLY, 0);
 	if (fd < 0) {
@@ -1795,7 +1895,7 @@ static int cmd_checkpoint(pid_t pid)
 	}
 
 	fprintf(stdout, "[i] download took %lu ms\n", diff_ms(&ts));
-	fprintf(stdout, "[i] stored at %s/pages-%d.img\n", dump_dir, pid);
+	fprintf(stdout, "[i] stored at %s/pages-%d.img\n", dfl_dump_dir, pid);
 
 	get_target_rss(pid, &vms_b);
 
@@ -2285,6 +2385,112 @@ static int read_command(int cd, struct service_command *svc_cmd)
 	return ret;
 }
 
+static int read_command_v2(int cd, struct service_command *svc_cmd, struct service_options *options, size_t len)
+{
+	/* There must be at least service_command that can be followed by service_checkpoint_options */
+	if (len < sizeof(struct service_command)) {
+		fprintf(stderr, "[-] %s(): cmds len to short: %d\n", __func__, (unsigned int)len);
+		return -1;
+	}
+
+	int ret = read_command(cd, svc_cmd);
+	if (ret < 0) {
+		fprintf(stderr, "%s(): Error reading a command!\n", __func__);
+		return ret;
+	}
+
+	len -= sizeof(struct service_command);
+
+	switch (svc_cmd->cmd) {
+		case MEMCR_CHECKPOINT: {
+			fprintf(stdout, "[+] read MEMCR_CHECKPOINT for %d\n", svc_cmd->pid);
+			/* try to read checkpoint options */
+			memcr_svc_checkpoint_options option;
+			while (len >= sizeof(option) && _read(cd, &option, sizeof(option)) > 0 ) {
+				len -= sizeof(option);
+
+				switch (option)	{
+				case MEMCR_CHECKPOINT_DUMPDIR: {
+					/* read string till NULL */
+					unsigned int pos = 0;
+					while (len-- > 0 && (_read(cd, &options->dump_dir[pos], sizeof(char)) == sizeof(char)) &&
+						   (options->dump_dir[pos] != 0) && (++pos < MEMCR_DUMPDIR_LEN_MAX));
+
+					if (pos >= MEMCR_DUMPDIR_LEN_MAX || options->dump_dir[pos] != 0)
+					{
+						fprintf(stderr, "[-] %s(): dump dir path too long or not terminated with NULL\n", __func__);
+						return -1;
+					}
+
+					options->is_dump_dir = TRUE;
+					fprintf(stdout, "[+] read dump dir path for this checkpoint: %s\n", options->dump_dir);
+					break;
+				}
+				case MEMCR_CHECKPOINT_COMPRESS_ALG:
+				{
+					if (len < sizeof(options->compress_alg) ||
+						_read(cd, &options->compress_alg, sizeof(options->compress_alg)) != sizeof(options->compress_alg)) {
+							fprintf(stderr, "[-] %s(): compression algorithm invalid\n", __func__);
+							return -1;
+					}
+
+					len -= sizeof(options->compress_alg);
+
+					if (options->compress_alg != MEMCR_COMPRESS_NONE
+#ifdef COMPRESS_LZ4
+					 && options->compress_alg != MEMCR_COMPRESS_LZ4
+#endif
+#ifdef COMPRESS_ZSTD
+					 && options->compress_alg != MEMCR_COMPRESS_ZSTD
+#endif
+					) {
+						/* skip if not support */
+						fprintf(stderr, "[-] %s(): compression algorithm not supported: %d\n", __func__, options->compress_alg);
+						break;
+					}
+
+					options->is_compress_alg = TRUE;
+					const char *caToS[] = {
+						[MEMCR_COMPRESS_NONE] = "none",
+						[MEMCR_COMPRESS_LZ4] = "lz4",
+						[MEMCR_COMPRESS_ZSTD] = "zstd"};
+					fprintf(stdout, "[+] read compress alg for this checkpoint: %s\n", caToS[options->compress_alg]);
+					break;
+				}
+				default:
+					fprintf(stderr, "[-] %s(): checkpoint option invalid: %d\n", __func__, option);
+				}
+			}
+			break;
+		}
+		case MEMCR_RESTORE: {
+			/* nothing more to read for RESTORE*/
+			fprintf(stdout, "[+] read MEMCR_RESTORE for %d\n", svc_cmd->pid);
+			break;
+		}
+		default:
+			fprintf(stderr, "%s(): Error command not expected or invalid: %d!\n", __func__, svc_cmd->cmd);
+			return -1;
+	}
+
+	return 0;
+}
+
+static void set_checkpoint_options_dfl(pid_t pid)
+{
+	for (int i=0; i<CHECKPOINTED_PIDS_LIMIT; ++i) {
+		if (checkpoint_service_data[i].pid == pid) {
+			if (checkpoint_service_data[i].options.is_dump_dir)
+				dfl_dump_dir = checkpoint_service_data[i].options.dump_dir;
+
+			if (checkpoint_service_data[i].options.is_compress_alg)
+				dfl_compress_alg = checkpoint_service_data[i].options.compress_alg;
+
+			return;
+		}
+	}
+}
+
 static int send_response_to_client(int cd, memcr_svc_response resp_code)
 {
 	struct service_response svc_resp = { .resp_code = resp_code };
@@ -2385,7 +2591,7 @@ static int checkpoint_worker(pid_t pid)
 	if (ret) {
 		fprintf(stderr, "[%d] Parasite checkpoint failed! Killing the target app...\n", getpid());
 		kill(pid, SIGKILL);
-		cleanup_pid(pid);
+		cleanup_pid(pid, dfl_dump_dir);
 		return ret;
 	}
 
@@ -2410,7 +2616,7 @@ static int restore_worker(int rd)
 	signal(SIGCHLD, SIG_DFL);
 	ret = execute_parasite_restore(post_checkpoint_cmd.pid);
 	unseize_target();
-	cleanup_pid(post_checkpoint_cmd.pid);
+	cleanup_pid(post_checkpoint_cmd.pid, dfl_dump_dir);
 
 	return ret;
 }
@@ -2426,6 +2632,7 @@ static int application_worker(pid_t pid, int checkpoint_resp_socket)
 		ret |= rsd;
 
 	register_socket_for_checkpoint_service_cmds(checkpoint_resp_socket);
+	set_checkpoint_options_dfl(pid);
 
 	if (0 == ret) {
 		ret |= checkpoint_worker(pid);
@@ -2650,7 +2857,7 @@ retry:
 	goto retry;
 }
 
-static void service_command(struct service_command_ctx *svc_ctx)
+static void service_command(struct service_command_ctx *svc_ctx, struct service_options *checkpoint_options)
 {
 	int ret = MEMCR_OK;
 	switch (svc_ctx->svc_cmd.cmd)
@@ -2667,7 +2874,7 @@ static void service_command(struct service_command_ctx *svc_ctx)
 			break;
 		}
 
-		init_pid_checkpoint_data(svc_ctx->svc_cmd.pid);
+		init_pid_checkpoint_data(svc_ctx->svc_cmd.pid, checkpoint_options);
 		ret = service_cmds_push_back(svc_ctx);
 		if (!ret)
 			fprintf(stdout, "[+] Checkpoint request scheduled...\n");
@@ -2720,6 +2927,7 @@ static int service_mode(const char *listen_location)
 	struct timeval tv;
 	int errsv;
 	pthread_t svc_cmd_thread_id;
+	struct service_options checkpoint_options;
 
 	if (listen_port > 0)
 		csd = setup_listen_tcp_socket(listen_port);
@@ -2767,7 +2975,19 @@ static int service_mode(const char *listen_location)
 				continue;
 			}
 
-			service_command(&svc_ctx);
+			clear_checkpoint_options(&checkpoint_options);
+
+			if (svc_ctx.svc_cmd.cmd == MEMCR_CMDS_V2) {
+				size_t cmds_len = svc_ctx.svc_cmd.pid;
+				ret = read_command_v2(cd, &svc_ctx.svc_cmd, &checkpoint_options, cmds_len);
+				if (ret < 0) {
+					fprintf(stderr, "%s(): Error reading a command!\n", __func__);
+					close(cd);
+					continue;
+				}
+			}
+
+			service_command(&svc_ctx, &checkpoint_options);
 			continue;
 		}
 
@@ -2826,7 +3046,7 @@ static int user_interactive_mode(pid_t pid)
 
 out:
 	unseize_target();
-	cleanup_pid(pid);
+	cleanup_pid(pid, dfl_dump_dir);
 
 	return ret;
 }
@@ -2834,7 +3054,7 @@ out:
 static void usage(const char *name, int status)
 {
 	fprintf(status ? stderr : stdout,
-		"%s [-h] [-p PID] [-d DIR] [-S DIR] [-l PORT|PATH] [-n] [-m] [-f] [-z] [-c] [-e]\n" \
+		"%s [-h] [-p PID] [-d DIR] [-S DIR] [-l PORT|PATH] [-n] [-m] [-f] [-z ALG] [-c] [-e]\n" \
 		"options:\n" \
 		"  -h --help		help\n" \
 		"  -p --pid		target processs pid\n" \
@@ -2849,24 +3069,13 @@ static void usage(const char *name, int status)
 		"  -n --no-wait		no wait for key press\n" \
 		"  -m --proc-mem		get pages from /proc/pid/mem\n" \
 		"  -f --rss-file		include file mapped memory\n" \
-		"  -z --compress		compress memory dump\n" \
+		"  -z --compress compress memory dump with selected algorithm: lz4, zstd\n" \
 		"  -c --checksum		enable md5 checksum for memory dump\n" \
 		"  -e --encrypt		enable encryption of memory dump\n" \
 		"  -t --timeout		timeout in seconds for checkpoint/restore execution in service mode\n",
 		name);
 
 	exit(status);
-}
-
-static void die(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-
-	exit(1);
 }
 
 int main(int argc, char *argv[])
@@ -2889,18 +3098,18 @@ int main(int argc, char *argv[])
 		{ "no-wait",			0,	NULL,	'n'},
 		{ "proc-mem",			0,	NULL,	'm'},
 		{ "rss-file",			0,	NULL,	'f'},
-		{ "compress",			0,	NULL,	'z'},
+		{ "compress",           1,  NULL,   'z'},
 		{ "checksum",			0,	NULL,	'c'},
 		{ "encrypt",			2,	0,	'e'},
 		{ "timeout",			1,	0,	't'},
 		{ NULL,				0,	NULL,	0  }
 	};
 
-	dump_dir = "/tmp";
+	dfl_dump_dir = "/tmp";
 	parasite_socket_dir = NULL;
 	parasite_socket_use_netns = 0;
 
-	while ((opt = getopt_long(argc, argv, "hp:d:S:Nl:nmfzce::t:", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hp:d:S:Nl:nmfz:ce::", long_options, &option_index)) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0], 0);
@@ -2909,7 +3118,7 @@ int main(int argc, char *argv[])
 				pid = atoi(optarg);
 				break;
 			case 'd':
-				dump_dir = optarg;
+				dfl_dump_dir = optarg;
 				break;
 			case 'S':
 				parasite_socket_dir = optarg;
@@ -2931,10 +3140,27 @@ int main(int argc, char *argv[])
 				rss_file = 1;
 				break;
 			case 'z':
+				if (optarg) {
+					if (strcmp(optarg, "lz4") == 0) {
 #ifndef COMPRESS_LZ4
-				die("not enabled, recompile with COMPRESS_LZ4=1\n");
+						die("not enabled, recompile with COMPRESS_LZ4=1\n");
 #endif
-				compress = 1;
+						dfl_compress_alg = MEMCR_COMPRESS_LZ4;
+					} else if (strcmp(optarg, "zstd") == 0) {
+#ifndef COMPRESS_ZSTD
+						die("not enabled, recompile with COMPRESS_ZSTD=1\n");
+#endif
+						dfl_compress_alg = MEMCR_COMPRESS_ZSTD;
+					}
+				} else {
+#ifdef COMPRESS_LZ4
+					dfl_compress_alg = MEMCR_COMPRESS_LZ4;
+#elif defined COMPRESS_ZSTD
+					dfl_compress_alg = MEMCR_COMPRESS_ZSTD;
+#else
+					die("not enabled, recompile with COMPRESS_LZ4=1 and/or COMPRESS_ZSTD=1\n");
+#endif
+				}
 				break;
 			case 'c':
 #ifndef CHECKSUM_MD5

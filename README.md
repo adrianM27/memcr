@@ -18,6 +18,7 @@ make
 ##### compilation options
 You can enable support for compression and checksumming of memory dump file:
  - `COMPRESS_LZ4=1` - requires liblz4
+ - `COMPRESS_ZSTD=1` - requires libzstd
  - `CHECKSUM_MD5=1` - requires libcrypto and openssl headers
 
  There is also `ENCRYPT` option for building `libencrypt.so` that provides sample implementation of encryption layer based on libcrypto API. memcr is not linked with libencrypt.so, but it can be preloaded with `LD_PRELOAD`.
@@ -65,7 +66,7 @@ options:
   -n --no-wait          no wait for key press
   -m --proc-mem         get pages from /proc/pid/mem
   -f --rss-file         include file mapped memory
-  -z --compress         compress memory dump
+  -z --compress compress memory dump with alg: lz4 or zstd
   -c --checksum         enable md5 checksum for memory dump
   -e --encrypt          enable encryption of memory dump
 ```
