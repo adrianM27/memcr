@@ -38,6 +38,11 @@ ifeq ($(COMPRESS_LZ4), 1)
     LDFLAGS += -llz4
 endif
 
+ifeq ($(COMPRESS_ZSTD), 1)
+    MCFLAGS += -DCOMPRESS_ZSTD
+    LDFLAGS += -lzstd
+endif
+
 ifeq ($(CHECKSUM_MD5), 1)
     MCFLAGS += -DCHECKSUM_MD5
     LDFLAGS += -lcrypto
